@@ -1,59 +1,145 @@
+import os
+import datetime
+import requests
 import arxiv
+from arxiv import Client
+from pdfminer.high_level import extract_text
+import lmstudio  
 import smtplib
 from email.mime.text import MIMEText
-import lmstudio
-from datetime import date
+from dotenv import load_dotenv, find_dotenv
 
-# Define your email details
-sender_email = "dnibs.ai@gmail.com"
-receiver_email = "david.k.niblick@gmail.com"
-today = date.today()
-subject = "Arxiv LLM Research " + str(today)
 
-client = arxiv.Client()
+# === Config ===
+SEARCH_QUERY = "LLM OR large language model"
+MAX_RESULTS = 2
+OUTPUT_FOLDER = "arxiv_summaries"
+DAYS_BACK = 360
+TODAY = datetime.date.today()
+SUBJECT = "Arxiv LLM Research " + str(TODAY)
 
-search = arxiv.Search(
-  query = "LLM",
-  max_results = 5,
-  sort_by = arxiv.SortCriterion.SubmittedDate
-)
-# Fetch top 5 papers from last week related to 'LLM research'
-papers = client.results(search)
+# === Load env variables ===
+dotenv_path = find_dotenv()
+if not dotenv_path:
+    raise FileNotFoundError(".env file not found")
+load_dotenv()
+SENDER_EMAIL = os.getenv('SENDER_EMAIL')
+RECEIVER_EMAILS = os.getenv('RECEIVER_EMAIL').split(',')
+EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')
+if not SENDER_EMAIL or not RECEIVER_EMAILS or not EMAIL_PASSWORD:
+    raise ValueError("Missing required environment variables: SENDER_EMAIL, RECEIVER_EMAIL, or EMAIL_PASSWORD")
 
-model = lmstudio.llm()
-all_summaries = ""
-metadata = ""
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-for paper in papers:
-    # Download and summarize the paper
-    paper.download_pdf()
-    with open(f"{paper.title}.pdf", "rb") as file:
-        text = file.read().decode('utf-8')
-        prompt = f"Summarize this paper in one paragraph:\n\n{text}"
-        summary = model.respond(prompt)
+# === Summarizer using LM Studio ===
+def summarize_text_with_lmstudio(text, model=None):
+    global lmstudio_model  # Use the global variable to store the model instance
 
-    # Update all_summaries and metadata
-    all_summaries += f"Summary of {paper['title']}:\n{summary}\n\n"
-    metadata += f"Title: {paper['title']}\nAuthors: {', '.join(paper.authors)}\nPublished: {paper.published}\nLink: {paper['pdf_url']}\n\n"
+    if model is None:
+        if lmstudio_model is None:  # Check if the model is already loaded
+            print("🤖 Loading LM Studio model...")
+            lmstudio_model = lmstudio.llm(model='gemma-3-27b-it')  # Load the model
+        model = lmstudio_model  # Use the loaded model
 
-# Save all_summaries and metadata to a file
-with open("all_summaries.txt", "w") as f:
-    f.write(metadata + "\n\n" + all_summaries)
+    prompt = (
+        "Summarize the following academic paper. Assume the reader is knowledgable about artificial intelligence, but has not read the paper."
+        "Start with a one-sentence summary of what the paper contributes. Then give a summary with more detail." 
+        "Include core concepts and any significant breakthroughs. End with proposed further research." 
+        "If possible, include links for more reading. Paper begins here:\n\n"
+        f"{text[:10000]}\n\nSummary:"
+    )
 
-body = f"Metadata:\n{metadata}\n\nAll Summaries:\n{all_summaries}"
+    result = model.respond(prompt)
+    return result  
 
-# Send the combined summary and metadata via email
-msg = MIMEText(body)
-msg['Subject'] = subject
-msg['From'] = sender_email
-msg['To'] = receiver_email
 
-try:
-    # Connect to the SMTP server (e.g., Gmail's SMTP server)
-    with smtplib.SMTP('smtp.gmail.com', 587) as server:
-        server.starttls()  # Secure the connection
-        server.login(sender_email, "your_app_password")  # Log in to your email account
-        server.sendmail(sender_email, receiver_email, msg.as_string())  # Send the email
-    print("Email sent successfully!")
-except Exception as e:
-    print(f"Failed to send email: {e}")
+
+# === Helpers ===
+def is_recent(published_date, days_back=DAYS_BACK):
+    published = datetime.datetime.fromisoformat(published_date.replace("Z", "+00:00"))
+    return (datetime.datetime.now(datetime.timezone.utc) - published).days <= days_back
+
+
+def download_pdf(url, filename):
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception(f"Failed to download PDF from {url}. HTTP Status: {response.status_code}")
+    with open(filename, 'wb') as f:
+        f.write(response.content)
+
+# === Main ===
+
+def main():
+    print(f"🔍 Searching arXiv for recent '{SEARCH_QUERY}' papers...")
+
+    # Create a client instance
+    client = arxiv.Client()
+    search = arxiv.Search(
+        query=SEARCH_QUERY,
+        max_results=MAX_RESULTS,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Descending
+    )
+
+    results = client.results(search)
+
+    model = lmstudio.llm()
+
+    email_body = 'Summary of recent publications regarding AI and LLMs for ' + str(TODAY)
+    count = 0
+    for result in results:
+        if not is_recent(result.published.isoformat()):
+            continue
+
+        arxiv_id = result.entry_id.split('/')[-1]
+        title = result.title.strip().replace("\n", " ")
+        pdf_url = result.pdf_url
+
+        print(f"\n📄 [{arxiv_id}] {title}")
+
+        # === Download PDF ===
+        pdf_path = os.path.join(OUTPUT_FOLDER, f"{arxiv_id}.pdf")
+        download_pdf(pdf_url, pdf_path)
+
+        # === Extract and Summarize ===
+        try:
+            text = extract_text(pdf_path)
+            summary = summarize_text_with_lmstudio(text, model=model)
+        except Exception as e:
+            summary = f"[Error extracting text or summarizing: {e}]"
+
+        # === Save summary ===
+        summary_file = os.path.join(OUTPUT_FOLDER, f"{arxiv_id}.txt")
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write(f"Title: {title}\n\nSummary:\n{summary}")
+
+        print(f"✅ Summary saved to {summary_file}")
+
+        email_body += f"Summary of {title}, {arxiv_id}:\n{pdf_url}\n{summary}\n\n\n\n\n"
+        email_body += f"------------------------------------------------\n\n"
+        count += 1
+
+    if count == 0:
+        print("⚠️ No recent papers found in the last 30 days.")
+    else:
+        print(f"\n🎉 Done! Summaries saved in '{OUTPUT_FOLDER}' folder.")
+
+    
+    # Create the email message
+    msg = MIMEText(email_body)
+    msg['Subject'] = SUBJECT
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = ', '.join(RECEIVER_EMAILS)  # This works for both single and multiple emails
+
+    try:
+        # Connect to the SMTP server (e.g., Gmail's SMTP server)
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()  # Secure the connection
+            server.login(SENDER_EMAIL, EMAIL_PASSWORD)  # Log in to your email account
+            server.sendmail(SENDER_EMAIL, RECEIVER_EMAILS, msg.as_string())  # Send the email
+        print("Email sent successfully!")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+if __name__ == "__main__":
+    main()
